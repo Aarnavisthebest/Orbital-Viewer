@@ -1,0 +1,8 @@
+{
+  "name": "Orbital Atlas",
+  "description": "Interactive 3D atlas of active objects currently in space from the Nancy Grace Roman Space Telescope to Voyager, with live video iframes, Deep Space Network tracking, and mission education dossiers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
