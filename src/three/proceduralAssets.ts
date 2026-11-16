@@ -194,12 +194,240 @@ function drawCrater(
 }
 
 export interface PlanetTextureBundle {
-  map: THREE.CanvasTexture;
-  bumpMap: THREE.CanvasTexture;
-  normalMap?: THREE.CanvasTexture;
-  roughnessMap?: THREE.CanvasTexture;
-  cloudMap?: THREE.CanvasTexture;
-  emissiveMap?: THREE.CanvasTexture;
+  map: THREE.Texture;
+  bumpMap?: THREE.Texture;
+  normalMap?: THREE.Texture;
+  roughnessMap?: THREE.Texture;
+  cloudMap?: THREE.Texture;
+  emissiveMap?: THREE.Texture;
+}
+
+const textureLoader = new THREE.TextureLoader();
+const realTextureCache = new Map<string, THREE.Texture>();
+const realEarthBundleCache: { bundle?: PlanetTextureBundle } = {};
+const realPlanetBundleCache = new Map<string, PlanetTextureBundle>();
+let realSaturnRingCache: THREE.Texture | null = null;
+let realSunTextureCache: THREE.Texture | null = null;
+
+function markShared<T extends THREE.Texture>(tex: T): T {
+  tex.userData.isSharedTexture = true;
+  return tex;
+}
+
+function loadSharedTexture(
+  url: string,
+  maxAnisotropy: number,
+  isColor: boolean,
+): THREE.Texture {
+  const key = `${url}:${isColor ? 'srgb' : 'lin'}`;
+  const existing = realTextureCache.get(key);
+  if (existing) return existing;
+
+  const tex = textureLoader.load(url);
+  tex.colorSpace = isColor ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  tex.anisotropy = Math.max(1, maxAnisotropy);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  markShared(tex);
+  realTextureCache.set(key, tex);
+  return tex;
+}
+
+export function getRealSunTexture(maxAnisotropy: number): THREE.Texture {
+  if (!realSunTextureCache) {
+    realSunTextureCache = loadSharedTexture('/textures/planets/sun_albedo.jpg', maxAnisotropy, true);
+  }
+  return realSunTextureCache;
+}
+
+export function getRealEarthTextureBundle(maxAnisotropy: number): PlanetTextureBundle {
+  if (realEarthBundleCache.bundle) {
+    return realEarthBundleCache.bundle;
+  }
+
+  const map = loadSharedTexture('/textures/planets/earth_day.jpg', maxAnisotropy, true);
+  const normalMap = loadSharedTexture('/textures/planets/earth_normal.jpg', maxAnisotropy, false);
+  const emissiveMap = loadSharedTexture('/textures/planets/earth_lights.jpg', maxAnisotropy, true);
+
+  // Build inverted ocean-specular -> PBR roughness canvas texture (dark oceans = glossy, bright continents = matte)
+  const roughCanvas = document.createElement('canvas');
+  roughCanvas.width = 512;
+  roughCanvas.height = 256;
+  const rCtx = roughCanvas.getContext('2d')!;
+  rCtx.fillStyle = '#999999';
+  rCtx.fillRect(0, 0, 512, 256);
+  const roughnessMap = markShared(new THREE.CanvasTexture(roughCanvas));
+  roughnessMap.anisotropy = maxAnisotropy;
+
+  const specImg = new Image();
+  specImg.src = '/textures/planets/earth_specular.jpg';
+  specImg.onload = () => {
+    const w = 1024;
+    const h = 512;
+    roughCanvas.width = w;
+    roughCanvas.height = h;
+    rCtx.drawImage(specImg, 0, 0, w, h);
+    const imgData = rCtx.getImageData(0, 0, w, h);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const spec = d[i] / 255; // high on water, low on land
+      const rough = Math.round(230 - spec * 175);
+      d[i] = rough;
+      d[i + 1] = rough;
+      d[i + 2] = rough;
+      d[i + 3] = 255;
+    }
+    rCtx.putImageData(imgData, 0, 0);
+    roughnessMap.needsUpdate = true;
+  };
+
+  // Convert grayscale cloud map into clean alpha-transparent cloud layer
+  const cloudCanvas = document.createElement('canvas');
+  cloudCanvas.width = 512;
+  cloudCanvas.height = 256;
+  const cCtx = cloudCanvas.getContext('2d')!;
+  const cloudMap = markShared(new THREE.CanvasTexture(cloudCanvas));
+  cloudMap.colorSpace = THREE.SRGBColorSpace;
+  cloudMap.anisotropy = maxAnisotropy;
+
+  const cloudImg = new Image();
+  cloudImg.src = '/textures/planets/earth_clouds.png';
+  cloudImg.onload = () => {
+    const w = cloudImg.naturalWidth || 1024;
+    const h = cloudImg.naturalHeight || 512;
+    cloudCanvas.width = w;
+    cloudCanvas.height = h;
+    cCtx.drawImage(cloudImg, 0, 0, w, h);
+    const imgData = cCtx.getImageData(0, 0, w, h);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const lum = (d[i] + d[i + 1] + d[i + 2]) / 3;
+      const alpha = lum < 24 ? 0 : Math.min(245, Math.round((lum - 24) * 1.15));
+      d[i] = 246;
+      d[i + 1] = 250;
+      d[i + 2] = 255;
+      d[i + 3] = alpha;
+    }
+    cCtx.putImageData(imgData, 0, 0);
+    cloudMap.needsUpdate = true;
+  };
+
+  realEarthBundleCache.bundle = {
+    map,
+    normalMap,
+    roughnessMap,
+    cloudMap,
+    emissiveMap,
+  };
+  return realEarthBundleCache.bundle;
+}
+
+const REAL_PLANET_MAP_PATHS: Partial<
+  Record<string, { map: string; bump?: string }>
+> = {
+  moon: { map: '/textures/planets/moon_albedo.jpg' },
+  mercury: {
+    map: '/textures/planets/mercury_albedo.jpg',
+    bump: '/textures/planets/mercury_bump.jpg',
+  },
+  venus: {
+    map: '/textures/planets/venus_albedo.jpg',
+    bump: '/textures/planets/venus_bump.jpg',
+  },
+  mars: {
+    map: '/textures/planets/mars_albedo.jpg',
+    bump: '/textures/planets/mars_bump.jpg',
+  },
+  jupiter: { map: '/textures/planets/jupiter_albedo.jpg' },
+  saturn: { map: '/textures/planets/saturn_albedo.jpg' },
+  uranus: { map: '/textures/planets/uranus_albedo.jpg' },
+  neptune: { map: '/textures/planets/neptune_albedo.jpg' },
+};
+
+export function getRealPlanetTextureBundle(
+  kind:
+    | 'moon'
+    | 'mercury'
+    | 'venus'
+    | 'mars'
+    | 'jupiter'
+    | 'saturn'
+    | 'uranus'
+    | 'neptune'
+    | 'ceres'
+    | 'exoplanet-temperate'
+    | 'exoplanet-ocean'
+    | 'exoplanet-lava',
+  maxAnisotropy: number,
+): PlanetTextureBundle {
+  const cached = realPlanetBundleCache.get(kind);
+  if (cached) return cached;
+
+  const spec = REAL_PLANET_MAP_PATHS[kind];
+  if (spec) {
+    const map = loadSharedTexture(spec.map, maxAnisotropy, true);
+    const bumpMap = spec.bump ? loadSharedTexture(spec.bump, maxAnisotropy, false) : undefined;
+    const bundle: PlanetTextureBundle = { map, bumpMap };
+    realPlanetBundleCache.set(kind, bundle);
+    return bundle;
+  }
+
+  const proc = createPlanetTextureBundle(kind, maxAnisotropy);
+  markShared(proc.map);
+  if (proc.bumpMap) markShared(proc.bumpMap);
+  if (proc.normalMap) markShared(proc.normalMap);
+  realPlanetBundleCache.set(kind, proc);
+  return proc;
+}
+
+export function getRealSaturnRingsTexture(maxAnisotropy: number): THREE.Texture {
+  if (realSaturnRingCache) return realSaturnRingCache;
+
+  // Start with crisp procedural Cassini ring profile and upgrade alpha+color from real NASA saturn_ring.png strip
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 32;
+  const ctx = canvas.getContext('2d')!;
+  const tex = markShared(new THREE.CanvasTexture(canvas));
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+
+  const fallback = createSaturnRingsTexture(maxAnisotropy);
+  ctx.drawImage(fallback.image as HTMLCanvasElement, 0, 0);
+  fallback.dispose();
+  tex.needsUpdate = true;
+
+  const ringImg = new Image();
+  ringImg.src = '/textures/planets/saturn_ring.png';
+  ringImg.onload = () => {
+    const w = ringImg.naturalWidth || 915;
+    const h = ringImg.naturalHeight || 64;
+    canvas.width = w;
+    canvas.height = h;
+    ctx.drawImage(ringImg, 0, 0, w, h);
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const d = imgData.data;
+    for (let px = 0; px < w; px++) {
+      const t = px / w;
+      const cassiniGap = t > 0.54 && t < 0.61;
+      const enckeGap = Math.abs(t - 0.84) < 0.012;
+      const innerFade = t < 0.06 ? t / 0.06 : 1;
+      const outerFade = t > 0.96 ? (1 - t) / 0.04 : 1;
+      for (let py = 0; py < h; py++) {
+        const idx = (py * w + px) * 4;
+        const lum = (d[idx] + d[idx + 1] + d[idx + 2]) / (3 * 255);
+        let alpha = Math.min(1, lum * 1.45) * innerFade * outerFade;
+        if (cassiniGap) alpha *= 0.1;
+        else if (enckeGap) alpha *= 0.18;
+        d[idx + 3] = Math.round(Math.max(0, Math.min(245, alpha * 245)));
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    tex.needsUpdate = true;
+  };
+
+  realSaturnRingCache = tex;
+  return tex;
 }
 
 export function createEarthTextureBundle(maxAnisotropy: number): PlanetTextureBundle {
@@ -378,7 +606,7 @@ export function createEarthTextureBundle(maxAnisotropy: number): PlanetTextureBu
   return { map, bumpMap, normalMap, roughnessMap, cloudMap, emissiveMap };
 }
 
-export function createEarthTexture(maxAnisotropy: number): THREE.CanvasTexture {
+export function createEarthTexture(maxAnisotropy: number): THREE.Texture {
   return createEarthTextureBundle(maxAnisotropy).map;
 }
 
@@ -716,7 +944,7 @@ export function createPlanetTexture(
     | 'exoplanet-ocean'
     | 'exoplanet-lava',
   maxAnisotropy: number,
-): THREE.CanvasTexture {
+): THREE.Texture {
   return createPlanetTextureBundle(kind, maxAnisotropy).map;
 }
 
@@ -1425,10 +1653,30 @@ export function createCelestialPreviewGroup(
     kind === 'star-orange' ||
     kind === 'pulsar'
   ) {
-    const surfaceMat = createStellarSurfaceMaterial(kind);
     const radius = kind === 'pulsar' ? 0.85 : 1.38;
-    const core = new THREE.Mesh(new THREE.SphereGeometry(radius, 48, 36), surfaceMat);
-    group.add(core);
+    if (kind === 'sun') {
+      const sunPhotoTex = getRealSunTexture(maxAnisotropy);
+      const sunPhotoMat = new THREE.MeshBasicMaterial({ map: sunPhotoTex });
+      const core = new THREE.Mesh(new THREE.SphereGeometry(radius, 64, 48), sunPhotoMat);
+      group.add(core);
+      const surfaceMat = createStellarSurfaceMaterial('sun');
+      surfaceMat.transparent = true;
+      surfaceMat.opacity = 0.24;
+      surfaceMat.blending = THREE.AdditiveBlending;
+      surfaceMat.depthWrite = false;
+      const plasmaShell = new THREE.Mesh(new THREE.SphereGeometry(radius * 1.008, 48, 36), surfaceMat);
+      group.add(plasmaShell);
+      group.userData.updateTime = (t: number) => {
+        surfaceMat.uniforms.uTime.value = t;
+      };
+    } else {
+      const surfaceMat = createStellarSurfaceMaterial(kind);
+      const core = new THREE.Mesh(new THREE.SphereGeometry(radius, 48, 36), surfaceMat);
+      group.add(core);
+      group.userData.updateTime = (t: number) => {
+        surfaceMat.uniforms.uTime.value = t;
+      };
+    }
 
     const coronaColor =
       kind === 'star-blue'
@@ -1496,33 +1744,30 @@ export function createCelestialPreviewGroup(
       group.add(torus);
     }
 
-    group.userData.updateTime = (t: number) => {
-      surfaceMat.uniforms.uTime.value = t;
-    };
     return group;
   }
 
-  // Planets & Moon (PBR + Tangent-Space Normal Map + Nightside Lights + Real Axial Tilt)
+  // Planets & Moon — Real NASA/USGS Photographic Maps (with PBR + Nightside Lights + Axial Tilt)
   const bundle =
     kind === 'earth'
-      ? createEarthTextureBundle(maxAnisotropy)
-      : createPlanetTextureBundle(kind, maxAnisotropy);
+      ? getRealEarthTextureBundle(maxAnisotropy)
+      : getRealPlanetTextureBundle(kind, maxAnisotropy);
 
   const planetMat = new THREE.MeshStandardMaterial({
     map: bundle.map,
     bumpMap: bundle.bumpMap,
-    bumpScale: kind === 'mars' || kind === 'moon' || kind === 'mercury' ? 0.045 : 0.02,
+    bumpScale: kind === 'mars' || kind === 'mercury' ? 0.042 : kind === 'venus' ? 0.015 : 0.02,
     normalMap: bundle.normalMap,
     normalScale: new THREE.Vector2(
-      kind === 'mars' || kind === 'moon' || kind === 'mercury' ? 0.95 : 0.55,
-      kind === 'mars' || kind === 'moon' || kind === 'mercury' ? 0.95 : 0.55,
+      kind === 'earth' ? 0.9 : 0.75,
+      kind === 'earth' ? 0.9 : 0.75,
     ),
     roughnessMap: bundle.roughnessMap,
-    roughness: kind === 'earth' ? 0.86 : kind === 'mars' || kind === 'moon' ? 0.88 : 0.72,
-    metalness: 0.06,
+    roughness: kind === 'earth' ? 0.92 : kind === 'mars' || kind === 'moon' ? 0.9 : 0.72,
+    metalness: 0.04,
     emissiveMap: bundle.emissiveMap,
     emissive: bundle.emissiveMap ? new THREE.Color(0xffd280) : new THREE.Color(0x000000),
-    emissiveIntensity: bundle.emissiveMap ? 0.42 : 0,
+    emissiveIntensity: bundle.emissiveMap ? 0.55 : 0,
   });
 
   const planetRadius = 1.38;
@@ -1575,10 +1820,10 @@ export function createCelestialPreviewGroup(
   if (kind === 'saturn') {
     const ringGeo = createSaturnRingGeometry(1.72, 2.95);
     const ringMat = new THREE.MeshStandardMaterial({
-      map: createSaturnRingsTexture(maxAnisotropy),
+      map: getRealSaturnRingsTexture(maxAnisotropy),
       side: THREE.DoubleSide,
       transparent: true,
-      roughness: 0.8,
+      roughness: 0.78,
       depthWrite: false,
     });
     const ring = new THREE.Mesh(ringGeo, ringMat);

@@ -23,6 +23,7 @@ import {
   createStarSystemModel,
   latLonToVector3,
 } from '../three/proceduralAssets';
+import { getLiveBodyEphemeris } from '../utils/ephemeris';
 
 interface CelestialBodyViewerProps {
   bodies: CelestialBody[];
@@ -92,6 +93,14 @@ export const CelestialBodyViewer: React.FC<CelestialBodyViewerProps> = ({
   const [isSpinning, setIsSpinning] = useState<boolean>(true);
   const [isZoomedToLandmark, setIsZoomedToLandmark] = useState<boolean>(false);
   const [imgFailed, setImgFailed] = useState<boolean>(false);
+  const [ephemTick, setEphemTick] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const id = window.setInterval(() => setEphemTick(Date.now()), 2000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const liveEphem = getLiveBodyEphemeris(selectedBody.id, new Date(ephemTick));
 
   const mountRef = useRef<HTMLDivElement>(null);
   const stageWrapperRef = useRef<HTMLDivElement>(null);
@@ -585,13 +594,16 @@ export const CelestialBodyViewer: React.FC<CelestialBodyViewerProps> = ({
         if ((obj as THREE.Mesh).isMesh) {
           const m = obj as THREE.Mesh;
           m.geometry.dispose();
+          const disposeTex = (tex?: THREE.Texture | null) => {
+            if (tex && !tex.userData?.isSharedTexture) tex.dispose();
+          };
           const disposeMat = (mat: THREE.Material) => {
             const std = mat as THREE.MeshStandardMaterial;
-            std.map?.dispose();
-            std.bumpMap?.dispose();
-            std.normalMap?.dispose();
-            std.roughnessMap?.dispose();
-            std.emissiveMap?.dispose();
+            disposeTex(std.map);
+            disposeTex(std.bumpMap);
+            disposeTex(std.normalMap);
+            disposeTex(std.roughnessMap);
+            disposeTex(std.emissiveMap);
             mat.dispose();
           };
           if (Array.isArray(m.material)) m.material.forEach(disposeMat);
@@ -1180,11 +1192,37 @@ export const CelestialBodyViewer: React.FC<CelestialBodyViewerProps> = ({
             )}
             {selectedBody.lightTimeFromEarth && (
               <div>
-                <span className="text-xs text-slate-400 block">One-Way Light Time</span>
+                <span className="text-xs text-slate-400 block">
+                  {liveEphem ? 'Live 1-Way Light Time' : 'One-Way Light Time'}
+                </span>
                 <span className="text-sm font-mono font-medium text-amber-300 tabular-nums">
-                  {selectedBody.lightTimeFromEarth}
+                  {liveEphem ? liveEphem.oneWayLightTimeLabel : selectedBody.lightTimeFromEarth}
                 </span>
               </div>
+            )}
+            {liveEphem && selectedBody.id !== 'earth' && (
+              <>
+                <div>
+                  <span className="text-xs text-slate-400 block">Live Range (Now)</span>
+                  <span className="text-sm font-mono font-medium text-cyan-300 tabular-nums">
+                    {liveEphem.auFromEarth < 0.05
+                      ? `${Math.round(liveEphem.kmFromEarth).toLocaleString()} km`
+                      : `${liveEphem.auFromEarth.toFixed(4)} AU`}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-xs text-slate-400 block">J2000 RA / Dec</span>
+                  <span className="text-xs font-mono font-medium text-slate-100 tabular-nums">
+                    {liveEphem.raFormatted} · {liveEphem.decFormatted}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-xs text-slate-400 block">Illumination / Mag</span>
+                  <span className="text-sm font-mono font-medium text-slate-100 tabular-nums">
+                    {liveEphem.phasePercent.toFixed(1)}% · mag {liveEphem.magnitude}
+                  </span>
+                </div>
+              </>
             )}
           </div>
 

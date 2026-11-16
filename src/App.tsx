@@ -6,10 +6,25 @@ import { LiveVideoBay } from './components/LiveVideoBay';
 import { MissionCatalog } from './components/MissionCatalog';
 import { MissionDossier } from './components/MissionDossier';
 import { OrbitalViewport3D, type ExtendedAtlasScale } from './components/OrbitalViewport3D';
+import { SpaceFlightTracker } from './components/SpaceFlightTracker';
 import { CELESTIAL_BODIES, type CelestialBody } from './data/celestialBodies';
 import { LAUNCH_ARCHIVE, type LaunchRecord } from './data/launchArchive';
 import { SPACE_OBJECTS, type SpaceObject } from './data/spaceObjects';
 import { useLiveIssTelemetry } from './hooks/useLiveIssTelemetry';
+import { useLiveSpaceTracker } from './hooks/useLiveSpaceTracker';
+import { getCurrentEpochYear } from './utils/ephemeris';
+
+const SPACECRAFT_TO_NORAD: Record<string, number> = {
+  iss: 25544,
+  tiangong: 48274,
+  hubble: 20580,
+  'landsat-9': 49260,
+  'goes-east': 41866,
+  gps: 48859,
+  starlink: 44713,
+  tess: 43435,
+  chandra: 25867,
+};
 
 export default function App() {
   const [selectedObject, setSelectedObject] = useState<SpaceObject>(SPACE_OBJECTS[0]);
@@ -20,8 +35,11 @@ export default function App() {
     LAUNCH_ARCHIVE.find((l) => l.id === 'apollo-18') || LAUNCH_ARCHIVE[0],
   );
   const [activeScale, setActiveScale] = useState<ExtendedAtlasScale>('earth-l2');
-  const [epochYear, setEpochYear] = useState<number>(2026.87);
+  const [epochYear, setEpochYear] = useState<number>(() =>
+    Number(getCurrentEpochYear().toFixed(3)),
+  );
   const [activeChannelId, setActiveChannelId] = useState<string>('iss-hd-earth');
+  const [selectedNoradId, setSelectedNoradId] = useState<number>(25544);
 
   const [aiContext, setAiContext] = useState<{ topic: string; category: string }>({
     topic: SPACE_OBJECTS[0].name,
@@ -35,6 +53,8 @@ export default function App() {
   } | null>(null);
 
   const issTelemetry = useLiveIssTelemetry();
+  const spaceTracker = useLiveSpaceTracker(selectedNoradId);
+  const issLiveTrack = spaceTracker.tracks.find((t) => t.noradId === 25544);
 
   const scrollToSection = (id: string) => {
     const el = document.getElementById(id);
@@ -46,6 +66,9 @@ export default function App() {
   const handleSelectSpacecraft = (obj: SpaceObject) => {
     setSelectedObject(obj);
     setAiContext({ topic: obj.name, category: `${obj.agency} ${obj.category}` });
+    if (SPACECRAFT_TO_NORAD[obj.id]) {
+      setSelectedNoradId(SPACECRAFT_TO_NORAD[obj.id]);
+    }
   };
 
   const handleSelectCelestialBody = (body: CelestialBody) => {
@@ -92,6 +115,11 @@ export default function App() {
     scrollToSection('live-feeds');
   };
 
+  const displayIssAlt = issLiveTrack?.altitudeKm ?? issTelemetry.altitude;
+  const displayIssCoords = issLiveTrack
+    ? `${issLiveTrack.latitude.toFixed(1)}°, ${issLiveTrack.longitude.toFixed(1)}°`
+    : `${issTelemetry.latitude.toFixed(1)}°, ${issTelemetry.longitude.toFixed(1)}°`;
+
   return (
     <div className="min-h-screen bg-[#07090E] text-slate-100 flex flex-col">
       {/* 3-Zone Top Navigation Bar */}
@@ -112,6 +140,12 @@ export default function App() {
               3D Universe
             </a>
             <a
+              href="#space-flight-tracker"
+              className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+            >
+              Flight Tracker
+            </a>
+            <a
               href="#celestial-worlds"
               className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
@@ -128,12 +162,6 @@ export default function App() {
               className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
               Live Feeds
-            </a>
-            <a
-              href="#ai-explorer"
-              className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
-            >
-              AI Briefs
             </a>
           </nav>
 
@@ -155,15 +183,16 @@ export default function App() {
           <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
             <div className="max-w-2xl">
               <p className="text-xs font-mono text-cyan-400 tracking-wide">
-                Spaceflight, Exoplanet & Extragalactic Observatory · Epoch {Math.floor(epochYear)}
+                Live SGP4 Flight Radar, NASA Planetary Photography & Ephemeris · Epoch{' '}
+                {Math.floor(epochYear)}
               </p>
               <h1 className="text-3xl sm:text-4xl lg:text-[42px] font-semibold text-slate-100 tracking-tight leading-tight mt-1.5">
-                Explore Active Spacecraft, Habitable Exoplanets & the Observable Universe
+                Track Live Spacecraft, Photorealistic Planets & the Observable Universe
               </h1>
             </div>
             <p className="text-sm text-slate-300 max-w-md leading-relaxed">
-              Zoom from Earth and Roman at L2 out through TRAPPIST-1, Tau Ceti, Kepler-452, and the
-              Milky Way all the way to Andromeda M31, Laniakea, and the Cosmic Web horizon.
+              Real-time SGP4 satellite positions over Earth, exact J2000 planetary ephemerides,
+              NASA surface maps, TRAPPIST-1 & Kepler-452 exoplanets, and the Cosmic Web horizon.
             </p>
           </div>
 
@@ -179,22 +208,24 @@ export default function App() {
             onScaleChange={setActiveScale}
             epochYear={epochYear}
             onEpochYearChange={setEpochYear}
+            liveTracks={spaceTracker.tracks}
+            selectedGroundTrack={spaceTracker.selectedGroundTrack}
           />
 
           {/* 4-Column Telemetry & Selection Strip Below Stage */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 bg-[#0E131D] border border-slate-800 rounded-lg p-4">
             <div>
-              <p className="text-xs text-slate-400">Active Spacecraft & Worlds</p>
-              <p className="text-xl font-mono font-semibold text-slate-100 mt-1">
-                {SPACE_OBJECTS.length + CELESTIAL_BODIES.length}{' '}
-                <span className="text-xs font-normal text-slate-400">3D objects</span>
+              <p className="text-xs text-slate-400">Live Tracked Transponders</p>
+              <p className="text-xl font-mono font-semibold text-slate-100 mt-1 tabular-nums">
+                {spaceTracker.tracks.length + spaceTracker.deepSpaceContacts.length}{' '}
+                <span className="text-xs font-normal text-slate-400">live objects</span>
               </p>
             </div>
             <div>
-              <p className="text-xs text-slate-400">ISS Live Altitude</p>
-              <p className="text-xl font-mono font-semibold text-slate-100 mt-1">
-                {issTelemetry.altitude.toFixed(1)}{' '}
-                <span className="text-xs font-normal text-slate-400">km LEO</span>
+              <p className="text-xs text-slate-400">ISS Live Position & Altitude</p>
+              <p className="text-xl font-mono font-semibold text-slate-100 mt-1 tabular-nums">
+                {displayIssAlt.toFixed(1)}{' '}
+                <span className="text-xs font-normal text-cyan-300">km · {displayIssCoords}</span>
               </p>
             </div>
             <div>
@@ -212,7 +243,25 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 2: Interactive 3D Planets, Exoplanets, Star Systems, Bennu, 67P & Observable Universe Viewer */}
+        {/* Section 2: FlightRadar24-style Live Space Flight Tracker & Ground-Track Radar */}
+        <SpaceFlightTracker
+          nowDate={spaceTracker.nowDate}
+          feedSource={spaceTracker.feedSource}
+          tracks={spaceTracker.tracks}
+          selectedNoradId={selectedNoradId}
+          onSelectNoradId={setSelectedNoradId}
+          selectedGroundTrack={spaceTracker.selectedGroundTrack}
+          deepSpaceContacts={spaceTracker.deepSpaceContacts}
+          subsolar={spaceTracker.subsolar}
+          spaceObjects={SPACE_OBJECTS}
+          celestialBodies={CELESTIAL_BODIES}
+          onFocusSpacecraftIn3D={handleFocusIn3D}
+          onInspectMission={handleInspectMission}
+          onLocateBodyIn3D={handleLocateBodyIn3D}
+          onAskAi={triggerAiBrief}
+        />
+
+        {/* Section 3: Interactive 3D Planets (Real NASA Photography), Exoplanets, Star Systems & Universe Viewer */}
         <CelestialBodyViewer
           bodies={CELESTIAL_BODIES}
           selectedBody={selectedBody}
@@ -235,7 +284,7 @@ export default function App() {
           }
         />
 
-        {/* Section 3: Past, Cancelled (Apollo 18 / Saturn V) & Future Launch Simulator */}
+        {/* Section 4: Past, Cancelled (Apollo 18 / Saturn V) & Future Launch Simulator */}
         <LaunchArchivePanel
           selectedLaunch={selectedLaunch}
           onSelectLaunch={(rec) => {
@@ -252,7 +301,7 @@ export default function App() {
           }
         />
 
-        {/* Section 4: Real-Time AI Cosmic Explorer (Groq openai/gpt-oss-120b) */}
+        {/* Section 5: Real-Time AI Cosmic Explorer */}
         <AiSpaceExplorer
           contextTopic={aiContext.topic}
           contextCategory={aiContext.category}
@@ -260,14 +309,14 @@ export default function App() {
           externalPromptTrigger={aiTrigger}
         />
 
-        {/* Section 5: Educational Mission Dossier */}
+        {/* Section 6: Educational Mission Dossier */}
         <MissionDossier
           mission={selectedObject}
           onFocusIn3D={handleFocusIn3D}
           onOpenNasaEyes={handleOpenNasaEyes}
         />
 
-        {/* Section 6: Live Video & Telemetry Iframes */}
+        {/* Section 7: Live Video & Telemetry Iframes */}
         <LiveVideoBay
           objects={SPACE_OBJECTS}
           selectedObject={selectedObject}
@@ -276,7 +325,7 @@ export default function App() {
           issTelemetry={issTelemetry}
         />
 
-        {/* Section 7: Complete Active Space Objects Directory */}
+        {/* Section 8: Complete Active Space Objects Directory */}
         <MissionCatalog
           objects={SPACE_OBJECTS}
           selectedId={selectedObject.id}
@@ -287,13 +336,16 @@ export default function App() {
 
       <footer className="border-t border-slate-800 mt-16">
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-400">
-          <p>Orbital Atlas — Spaceflight, Planetary & Galactic Observatory</p>
+          <p>Orbital Atlas — Live Spaceflight Radar, Ephemeris & Observatory</p>
           <div className="flex items-center gap-6">
             <a href="#atlas-stage" className="hover:text-slate-200 transition-colors">
-              3D Galaxy
+              3D Universe
+            </a>
+            <a href="#space-flight-tracker" className="hover:text-slate-200 transition-colors">
+              Flight Tracker
             </a>
             <a href="#celestial-worlds" className="hover:text-slate-200 transition-colors">
-              Worlds & Bennu/67P
+              Worlds & Exoplanets
             </a>
             <a href="#launch-archive" className="hover:text-slate-200 transition-colors">
               Launch Archive

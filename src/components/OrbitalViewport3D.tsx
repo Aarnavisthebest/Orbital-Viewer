@@ -19,20 +19,31 @@ import {
 } from 'lucide-react';
 import type { CelestialBody } from '../data/celestialBodies';
 import type { AtlasScale, SpaceObject } from '../data/spaceObjects';
+import type { GroundTrackPoint, LiveOrbitalTrackItem } from '../hooks/useLiveSpaceTracker';
 import {
   PLANET_AXIAL_TILT_DEG,
   createAsteroidOrCometModel,
   createAtmosphereHaloMesh,
   createDeepSpaceDome,
-  createEarthTextureBundle,
   createNebulaGlowTexture,
-  createPlanetTextureBundle,
   createSaturnRingGeometry,
-  createSaturnRingsTexture,
   createSpacecraftModel,
   createStellarSurfaceMaterial,
+  getRealEarthTextureBundle,
+  getRealPlanetTextureBundle,
+  getRealSaturnRingsTexture,
+  getRealSunTexture,
   solveKeplerPosition,
 } from '../three/proceduralAssets';
+import {
+  epochYearToDate,
+  geodeticToSceneVec3,
+  getCurrentEpochYear,
+  getHeliocentricScenePosition,
+  getMoonRelativeScenePos,
+  getSubsolarLatLon,
+  sampleRealOrbitalLoop,
+} from '../utils/ephemeris';
 
 export type ExtendedAtlasScale = AtlasScale | 'galaxy' | 'universe';
 
@@ -48,6 +59,11 @@ interface OrbitalViewport3DProps {
   onScaleChange: (scale: ExtendedAtlasScale) => void;
   epochYear: number;
   onEpochYearChange: (year: number) => void;
+  liveTracks?: LiveOrbitalTrackItem[];
+  selectedGroundTrack?: {
+    past: GroundTrackPoint[];
+    future: GroundTrackPoint[];
+  };
 }
 
 const _vec3 = new THREE.Vector3();
@@ -126,6 +142,8 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
   onScaleChange,
   epochYear,
   onEpochYearChange,
+  liveTracks = [],
+  selectedGroundTrack,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasMountRef = useRef<HTMLDivElement>(null);
@@ -134,6 +152,7 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
 
   const [dockCollapsed, setDockCollapsed] = useState(false);
   const [timeScale, setTimeScale] = useState<number>(1);
+  const [liveUtcSync, setLiveUtcSync] = useState<boolean>(true);
   const [epochFilterOnly, setEpochFilterOnly] = useState<boolean>(false);
   const [webglError, setWebglError] = useState<string | null>(null);
 
@@ -141,8 +160,11 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
   const selectedIdRef = useRef<string>(selectedId);
   const selectedBodyIdRef = useRef<string>(selectedBodyId);
   const timeScaleRef = useRef<number>(timeScale);
+  const liveUtcSyncRef = useRef<boolean>(liveUtcSync);
   const epochYearRef = useRef<number>(epochYear);
   const epochFilterOnlyRef = useRef<boolean>(epochFilterOnly);
+  const liveTracksRef = useRef<LiveOrbitalTrackItem[]>(liveTracks);
+  const groundTrackRef = useRef(selectedGroundTrack);
   const onSelectRef = useRef(onSelectObject);
   const onSelectBodyRef = useRef(onSelectCelestialBody);
   const onEpochChangeRef = useRef(onEpochYearChange);
@@ -177,11 +199,24 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
 
   useEffect(() => {
     timeScaleRef.current = timeScale;
+    if (timeScale !== 1) setLiveUtcSync(false);
   }, [timeScale]);
+
+  useEffect(() => {
+    liveUtcSyncRef.current = liveUtcSync;
+  }, [liveUtcSync]);
 
   useEffect(() => {
     epochYearRef.current = epochYear;
   }, [epochYear]);
+
+  useEffect(() => {
+    liveTracksRef.current = liveTracks;
+  }, [liveTracks]);
+
+  useEffect(() => {
+    groundTrackRef.current = selectedGroundTrack;
+  }, [selectedGroundTrack]);
 
   useEffect(() => {
     epochFilterOnlyRef.current = epochFilterOnly;
@@ -386,27 +421,25 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
 
     const disposableTextures: THREE.Texture[] = [];
 
-    // --- 1. EARTH & LAGRANGE GROUP ---
-    const earthBundle = createEarthTextureBundle(maxAnisotropy);
+    // --- 1. EARTH & LAGRANGE GROUP (Real NASA Photography + SGP4 Ground Track Ribbon) ---
+    const earthBundle = getRealEarthTextureBundle(maxAnisotropy);
     const earthTiltRad = THREE.MathUtils.degToRad(PLANET_AXIAL_TILT_DEG.earth);
     const earthMesh = new THREE.Mesh(
       new THREE.SphereGeometry(2.8, 64, 48),
       new THREE.MeshStandardMaterial({
         map: earthBundle.map,
-        bumpMap: earthBundle.bumpMap,
-        bumpScale: 0.04,
         normalMap: earthBundle.normalMap,
-        normalScale: new THREE.Vector2(0.85, 0.85),
+        normalScale: new THREE.Vector2(0.9, 0.9),
         roughnessMap: earthBundle.roughnessMap,
-        roughness: 0.86,
-        metalness: 0.06,
+        roughness: 0.92,
+        metalness: 0.04,
         emissiveMap: earthBundle.emissiveMap,
         emissive: new THREE.Color(0xffd280),
-        emissiveIntensity: 0.38,
+        emissiveIntensity: 0.52,
       }),
     );
     earthMesh.rotation.order = 'ZYX';
-    earthMesh.rotation.z = earthTiltRad;
+    earthMesh.rotation.z = 0; // Aligned to ECEF in Live UTC mode for accurate ground-track overlay
     scaleGroups['earth-l2'].add(earthMesh);
 
     const earthClouds = new THREE.Mesh(
@@ -419,26 +452,29 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         roughness: 0.9,
       }),
     );
-    earthClouds.rotation.order = 'ZYX';
-    earthClouds.rotation.z = earthTiltRad;
     scaleGroups['earth-l2'].add(earthClouds);
 
     scaleGroups['earth-l2'].add(createAtmosphereHaloMesh(3.01, 0x38bdf8, 0.8));
 
+    // Live 3D Orbital Ground-Track Arc around Earth for locked SGP4 spacecraft
+    const liveTrackLineGeo = new THREE.BufferGeometry();
+    const liveTrackLine = new THREE.Line(
+      liveTrackLineGeo,
+      new THREE.LineBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.85 }),
+    );
+    liveTrackLine.frustumCulled = false;
+    scaleGroups['earth-l2'].add(liveTrackLine);
+
     const earthBody = celestialBodies.find((b) => b.id === 'earth');
     if (earthBody) registerClickableBody(earthBody, earthMesh, 3.1, 3.35);
 
-    const moonBundle = createPlanetTextureBundle('moon', maxAnisotropy);
+    const moonBundle = getRealPlanetTextureBundle('moon', maxAnisotropy);
     const moonPivot = new THREE.Group();
     const moonMesh = new THREE.Mesh(
       new THREE.SphereGeometry(0.76, 40, 32),
       new THREE.MeshStandardMaterial({
         map: moonBundle.map,
-        bumpMap: moonBundle.bumpMap,
-        bumpScale: 0.045,
-        normalMap: moonBundle.normalMap,
-        normalScale: new THREE.Vector2(0.95, 0.95),
-        roughness: 0.9,
+        roughness: 0.92,
         metalness: 0.02,
       }),
     );
@@ -482,12 +518,22 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
     const shaderTimeUpdaters: Array<(t: number) => void> = [];
 
     const buildSolarAnchor = (targetGroup: THREE.Group, sunRadius: number, clickableSun: boolean) => {
+      const sunTex = getRealSunTexture(maxAnisotropy);
+      const sun = new THREE.Mesh(
+        new THREE.SphereGeometry(sunRadius, 48, 36),
+        new THREE.MeshBasicMaterial({ map: sunTex }),
+      );
+      targetGroup.add(sun);
+
       const sunMat = createStellarSurfaceMaterial('sun');
+      sunMat.transparent = true;
+      sunMat.opacity = 0.22;
+      sunMat.blending = THREE.AdditiveBlending;
+      sunMat.depthWrite = false;
       shaderTimeUpdaters.push((t) => {
         sunMat.uniforms.uTime.value = t;
       });
-      const sun = new THREE.Mesh(new THREE.SphereGeometry(sunRadius, 40, 32), sunMat);
-      targetGroup.add(sun);
+      targetGroup.add(new THREE.Mesh(new THREE.SphereGeometry(sunRadius * 1.01, 40, 32), sunMat));
 
       targetGroup.add(createAtmosphereHaloMesh(sunRadius * 1.28, 0xfbbf24, 0.9));
 
@@ -523,6 +569,8 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
     scaleGroups['outer-solar'].add(outerGrid);
 
     const orbitingBodies: {
+      id: string;
+      solarScale?: 'inner-solar' | 'outer-solar';
       body?: CelestialBody;
       mesh: THREE.Object3D;
       radius: number;
@@ -558,29 +606,23 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
           new THREE.SphereGeometry(p.size, 36, 28),
           new THREE.MeshStandardMaterial({
             map: earthBundle.map,
-            bumpMap: earthBundle.bumpMap,
-            bumpScale: 0.02,
             normalMap: earthBundle.normalMap,
             normalScale: new THREE.Vector2(0.7, 0.7),
             roughnessMap: earthBundle.roughnessMap,
-            roughness: 0.82,
+            roughness: 0.88,
           }),
         );
         mesh.rotation.z = tiltRad;
         holder.add(mesh);
       } else {
-        const bdl = createPlanetTextureBundle(p.kind, maxAnisotropy);
-        disposableTextures.push(bdl.map, bdl.bumpMap);
-        if (bdl.normalMap) disposableTextures.push(bdl.normalMap);
+        const bdl = getRealPlanetTextureBundle(p.kind, maxAnisotropy);
         const mesh = new THREE.Mesh(
           new THREE.SphereGeometry(p.size, 36, 28),
           new THREE.MeshStandardMaterial({
             map: bdl.map,
             bumpMap: bdl.bumpMap,
-            bumpScale: 0.028,
-            normalMap: bdl.normalMap,
-            normalScale: new THREE.Vector2(0.85, 0.85),
-            roughness: 0.82,
+            bumpScale: p.kind === 'mars' || p.kind === 'mercury' ? 0.028 : 0.012,
+            roughness: 0.85,
           }),
         );
         mesh.rotation.z = tiltRad;
@@ -597,6 +639,8 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       }
 
       orbitingBodies.push({
+        id: p.id,
+        solarScale: 'inner-solar',
         body,
         mesh: holder,
         radius: p.r,
@@ -606,13 +650,8 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         inclinationDeg: p.inc,
       });
 
-      const incRad = THREE.MathUtils.degToRad(p.inc);
-      const pts: THREE.Vector3[] = [];
-      for (let i = 0; i <= 96; i++) {
-        const ang = (i / 96) * Math.PI * 2;
-        pts.push(solveKeplerPosition(p.r, p.ecc, incRad, ang));
-      }
-      scaleGroups['inner-solar'].add(makeLoop(pts, p.ringColor, 0.48));
+      const pts = sampleRealOrbitalLoop(p.id, new Date(), 'inner-solar', 96);
+      scaleGroups['inner-solar'].add(makeLoop(pts, p.ringColor, 0.52));
     }
 
     // Notable Asteroids & Comets in 3D: Bennu, 67P, 16 Psyche, 1 Ceres
@@ -630,6 +669,7 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       registerClickableBody(body, model, 1.35, 1.3);
 
       orbitingBodies.push({
+        id: aid,
         body,
         mesh: model,
         radius: body.solarOrbit.radius,
@@ -648,7 +688,7 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       targetGrp.add(makeLoop(pts, new THREE.Color(body.accentColor).getHex(), 0.4));
     }
 
-    // Outer solar planets (Jupiter, Saturn, Uranus, Neptune)
+    // Outer solar planets (Jupiter, Saturn, Uranus, Neptune — Real NASA Planetary Maps + Live Astronomy Engine)
     const outerSpecs: Array<{
       id: string;
       kind: 'jupiter' | 'saturn' | 'uranus' | 'neptune';
@@ -668,9 +708,7 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
     ];
     for (const p of outerSpecs) {
       const holder = new THREE.Group();
-      const bdl = createPlanetTextureBundle(p.kind, maxAnisotropy);
-      disposableTextures.push(bdl.map, bdl.bumpMap);
-      if (bdl.normalMap) disposableTextures.push(bdl.normalMap);
+      const bdl = getRealPlanetTextureBundle(p.kind, maxAnisotropy);
 
       const tiltHolder = new THREE.Group();
       tiltHolder.rotation.z = THREE.MathUtils.degToRad(PLANET_AXIAL_TILT_DEG[p.kind] ?? 0);
@@ -679,10 +717,6 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         new THREE.SphereGeometry(p.size, 36, 28),
         new THREE.MeshStandardMaterial({
           map: bdl.map,
-          bumpMap: bdl.bumpMap,
-          bumpScale: 0.02,
-          normalMap: bdl.normalMap,
-          normalScale: new THREE.Vector2(0.55, 0.55),
           roughness: 0.72,
         }),
       );
@@ -690,14 +724,13 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       tiltHolder.add(createAtmosphereHaloMesh(p.size * 1.07, p.atmoColor, 0.42));
 
       if (p.hasRings) {
-        const ringTex = createSaturnRingsTexture(maxAnisotropy);
-        disposableTextures.push(ringTex);
+        const ringTex = getRealSaturnRingsTexture(maxAnisotropy);
         const ringGeo = createSaturnRingGeometry(p.size * 1.32, p.size * 2.32);
         const ringMat = new THREE.MeshStandardMaterial({
           map: ringTex,
           side: THREE.DoubleSide,
           transparent: true,
-          roughness: 0.8,
+          roughness: 0.78,
           depthWrite: false,
         });
         const ringMesh = new THREE.Mesh(ringGeo, ringMat);
@@ -711,6 +744,8 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       if (body) registerClickableBody(body, holder, p.size * 1.55, p.size * 1.85);
 
       orbitingBodies.push({
+        id: p.id,
+        solarScale: 'outer-solar',
         body,
         mesh: holder,
         radius: p.r,
@@ -720,13 +755,8 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         inclinationDeg: p.inc,
       });
 
-      const incRad = THREE.MathUtils.degToRad(p.inc);
-      const pts: THREE.Vector3[] = [];
-      for (let i = 0; i <= 112; i++) {
-        const ang = (i / 112) * Math.PI * 2;
-        pts.push(solveKeplerPosition(p.r, p.ecc, incRad, ang));
-      }
-      scaleGroups['outer-solar'].add(makeLoop(pts, 0x334155, 0.42));
+      const pts = sampleRealOrbitalLoop(p.id, new Date(), 'outer-solar', 112);
+      scaleGroups['outer-solar'].add(makeLoop(pts, 0x334155, 0.48));
     }
 
     // Main Asteroid Belt instanced swarm
@@ -1344,7 +1374,9 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         }
       }
 
-      // Epoch offset drives real Keplerian orbital displacement when scrubbing timeline!
+      // Epoch offset drives real astronomical ephemeris!
+      const isLiveSync = liveUtcSyncRef.current;
+      const simDate = isLiveSync ? new Date() : epochYearToDate(epochYearRef.current);
       const epochPhase = (epochYearRef.current - 2026) * 0.85;
       const effectiveTime = simTime + epochPhase;
 
@@ -1359,9 +1391,46 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       scaleGroups['galaxy'].visible = curScale === 'galaxy';
       scaleGroups['universe'].visible = curScale === 'universe';
 
-      earthMesh.rotation.y += delta * 0.12 * visualMult;
-      earthClouds.rotation.y += delta * 0.16 * visualMult;
-      moonPivot.rotation.y = effectiveTime * 0.08;
+      if (curScale === 'earth-l2') {
+        if (isLiveSync) {
+          // Keep Earth fixed in ECEF coordinates so real-time SGP4 satellites sit over their true countries!
+          earthMesh.rotation.set(0, 0, 0);
+          earthClouds.rotation.set(0, shaderClock * 0.004, 0);
+          const subsolar = getSubsolarLatLon(simDate);
+          keyLight.position.copy(geodeticToSceneVec3(subsolar.latDeg, subsolar.lonDeg, 45));
+
+          // Update true Moon direction relative to Earth
+          const realMoonPos = getMoonRelativeScenePos(simDate, 12.2);
+          moonPivot.rotation.y = 0;
+          moonMesh.position.copy(realMoonPos);
+
+          // Update 3D ground-track ribbon around Earth for the selected orbiter
+          const gt = groundTrackRef.current;
+          if (gt && gt.future.length > 2) {
+            const pts3d: THREE.Vector3[] = [];
+            for (const p of gt.future) {
+              const rTrack = 2.8 + Math.min(2.4, Math.max(0.45, (p.altKm / 6371) * 2.8));
+              pts3d.push(geodeticToSceneVec3(p.lat, p.lon, rTrack));
+            }
+            liveTrackLineGeo.setFromPoints(pts3d);
+            liveTrackLine.visible = true;
+          } else {
+            liveTrackLine.visible = false;
+          }
+        } else {
+          earthMesh.rotation.z = earthTiltRad;
+          earthMesh.rotation.y += delta * 0.12 * visualMult;
+          earthClouds.rotation.z = earthTiltRad;
+          earthClouds.rotation.y += delta * 0.16 * visualMult;
+          keyLight.position.set(35, 18, 28);
+          moonMesh.position.set(12.2, 0, 0);
+          moonPivot.rotation.y = effectiveTime * 0.08;
+          liveTrackLine.visible = false;
+        }
+      } else {
+        keyLight.position.set(35, 18, 28);
+      }
+
       if (curScale === 'galaxy') {
         scaleGroups['galaxy'].rotation.y += delta * 0.012 * visualMult;
       } else if (curScale === 'universe') {
@@ -1386,13 +1455,17 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         starlinkSwarm.instanceMatrix.needsUpdate = true;
       }
 
-      // Orbiting Planets & Asteroids driven by Keplerian Equation + Epoch
+      // Orbiting Planets driven by genuine astronomy-engine J2000 ephemeris, asteroids by Keplerian solver
       for (const p of orbitingBodies) {
-        const a = p.angle + effectiveTime * p.speed;
-        const inc = THREE.MathUtils.degToRad(p.inclinationDeg);
-        solveKeplerPosition(p.radius, p.eccentricity, inc, a, p.mesh.position);
-        if (p.body && (p.body.type === 'Asteroid' || p.body.type === 'Comet')) {
-          p.mesh.rotation.y += delta * 0.6 * Math.max(0.2, visualMult);
+        if (p.solarScale) {
+          getHeliocentricScenePosition(p.id, simDate, p.solarScale, p.mesh.position);
+        } else {
+          const a = p.angle + effectiveTime * p.speed;
+          const inc = THREE.MathUtils.degToRad(p.inclinationDeg);
+          solveKeplerPosition(p.radius, p.eccentricity, inc, a, p.mesh.position);
+          if (p.body && (p.body.type === 'Asteroid' || p.body.type === 'Comet')) {
+            p.mesh.rotation.y += delta * 0.6 * Math.max(0.2, visualMult);
+          }
         }
       }
 
@@ -1405,10 +1478,14 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         if (flyToBodyIdRef.current === bNode.body.id) flyBodyNode = bNode;
       }
 
-      // Spacecraft positions & Epoch visibility filtering
+      // Spacecraft positions & Epoch visibility filtering (SGP4 Live coordinates for Earth orbiters in Live Sync!)
       let flyTargetNode: SpacecraftNode | null = null;
       const curEpochFloor = Math.floor(epochYearRef.current);
       const filterPreLaunch = epochFilterOnlyRef.current;
+      const liveMap = new Map<string, LiveOrbitalTrackItem>();
+      for (const lt of liveTracksRef.current) {
+        if (lt.spaceObjectId) liveMap.set(lt.spaceObjectId, lt);
+      }
 
       for (const node of spacecraftNodes) {
         const isLaunched = node.launchYear <= curEpochFloor;
@@ -1423,10 +1500,19 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
         if (flyToIdRef.current === node.obj.id && showNode) flyTargetNode = node;
 
         const a = cfg.initialAngle + effectiveTime * cfg.speed;
-        if (cfg.isL2Halo) {
+        const liveMatch = isLiveSync ? liveMap.get(node.obj.id) : undefined;
+
+        if (liveMatch && cfg.scale === 'earth-l2' && !cfg.isL2Halo && !cfg.isL1Halo && cfg.center === 'earth') {
+          // Real-time SGP4 geodetic coordinates mapped accurately onto NASA Blue Marble globe!
+          const rVisual = 2.8 + Math.min(3.8, Math.max(0.5, (liveMatch.altitudeKm / 6371) * 2.8));
+          node.group.position.copy(geodeticToSceneVec3(liveMatch.latitude, liveMatch.longitude, rVisual));
+          node.group.lookAt(0, 0, 0);
+        } else if (cfg.isL2Halo) {
           node.group.position.set(17.5 + Math.cos(a * 2) * 0.45, Math.sin(a) * 2.2, Math.cos(a) * 2.7);
+          node.group.rotation.y = -a + Math.PI / 2;
         } else if (cfg.isL1Halo) {
           node.group.position.set(-16.5 + Math.cos(a * 2) * 0.35, Math.sin(a) * 1.8, Math.cos(a) * 2.2);
+          node.group.rotation.y = -a + Math.PI / 2;
         } else if (cfg.center === 'moon') {
           moonMesh.getWorldPosition(_vec3);
           node.group.position.set(
@@ -1434,11 +1520,12 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
             Math.sin(a) * cfg.radius * 0.9,
             _vec3.z + Math.sin(a) * cfg.radius * 0.5,
           );
+          node.group.rotation.y = -a + Math.PI / 2;
         } else {
           const inc = THREE.MathUtils.degToRad(cfg.inclinationDeg);
           solveKeplerPosition(cfg.radius, cfg.eccentricity, inc, a, node.group.position);
+          node.group.rotation.y = -a + Math.PI / 2;
         }
-        node.group.rotation.y = -a + Math.PI / 2;
       }
 
       // Camera smooth transitions
@@ -1563,16 +1650,19 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
       renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
       envTex.dispose();
       glowTex.dispose();
-      earthBundle.map.dispose();
-      earthBundle.bumpMap.dispose();
-      earthBundle.normalMap?.dispose();
-      earthBundle.roughnessMap?.dispose();
-      earthBundle.cloudMap?.dispose();
-      earthBundle.emissiveMap?.dispose();
-      moonBundle.map.dispose();
-      moonBundle.bumpMap.dispose();
-      moonBundle.normalMap?.dispose();
-      for (const tex of disposableTextures) tex.dispose();
+      const safeDispose = (t?: THREE.Texture | null) => {
+        if (t && !t.userData?.isSharedTexture) t.dispose();
+      };
+      safeDispose(earthBundle.map);
+      safeDispose(earthBundle.bumpMap);
+      safeDispose(earthBundle.normalMap);
+      safeDispose(earthBundle.roughnessMap);
+      safeDispose(earthBundle.cloudMap);
+      safeDispose(earthBundle.emissiveMap);
+      safeDispose(moonBundle.map);
+      safeDispose(moonBundle.bumpMap);
+      safeDispose(moonBundle.normalMap);
+      for (const tex of disposableTextures) safeDispose(tex);
       renderer.dispose();
       if (mount.contains(renderer.domElement)) {
         mount.removeChild(renderer.domElement);
@@ -1804,8 +1894,24 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
               </button>
             </div>
 
-            {/* Simulation Speedup Multipliers */}
+            {/* Simulation Speedup Multipliers & Live UTC Sync */}
             <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setLiveUtcSync(true);
+                  setTimeScale(1);
+                  onEpochYearChange(Number(getCurrentEpochYear().toFixed(3)));
+                }}
+                className={`px-2 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap ${
+                  liveUtcSync
+                    ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200 font-semibold'
+                    : 'border-slate-700 bg-[#07090E] text-slate-300 hover:border-emerald-400/70'
+                }`}
+                title="Lock 3D planets & Earth orbiters to real-time astronomical UTC positions"
+              >
+                Live UTC
+              </button>
               <button
                 type="button"
                 onClick={() => setTimeScale((prev) => (prev === 0 ? 1 : 0))}
@@ -1818,9 +1924,12 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
                 <button
                   key={mult}
                   type="button"
-                  onClick={() => setTimeScale(mult)}
+                  onClick={() => {
+                    setLiveUtcSync(false);
+                    setTimeScale(mult);
+                  }}
                   className={`inline-flex items-center gap-0.5 px-2 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap ${
-                    timeScale === mult
+                    !liveUtcSync && timeScale === mult
                       ? 'border-amber-400 bg-amber-500/20 text-amber-200'
                       : 'border-slate-700 bg-[#07090E] text-slate-300 hover:border-slate-500'
                   }`}
@@ -1835,7 +1944,9 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
                   flyToIdRef.current = null;
                   flyToBodyIdRef.current = null;
                   resetViewRequestedRef.current = true;
-                  onEpochYearChange(2026.87);
+                  setLiveUtcSync(true);
+                  setTimeScale(1);
+                  onEpochYearChange(Number(getCurrentEpochYear().toFixed(3)));
                 }}
                 className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded border border-slate-700 bg-[#07090E] text-slate-300 hover:border-slate-500 hover:text-white whitespace-nowrap"
               >
@@ -1894,7 +2005,10 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
                   <button
                     key={preset.label}
                     type="button"
-                    onClick={() => onEpochYearChange(preset.year)}
+                    onClick={() => {
+                      setLiveUtcSync(false);
+                      onEpochYearChange(preset.year);
+                    }}
                     className={`px-2 py-0.5 text-[11px] font-mono rounded border transition-colors whitespace-nowrap ${
                       isClose
                         ? 'border-amber-400 bg-amber-500/20 text-amber-200'
@@ -1915,7 +2029,10 @@ export const OrbitalViewport3D: React.FC<OrbitalViewport3DProps> = ({
                 max={2045}
                 step={0.1}
                 value={epochYear}
-                onChange={(e) => onEpochYearChange(Number(e.target.value))}
+                onChange={(e) => {
+                  setLiveUtcSync(false);
+                  onEpochYearChange(Number(e.target.value));
+                }}
                 className="w-32 accent-amber-400"
               />
               <span className="text-[11px] font-mono text-amber-300 tabular-nums whitespace-nowrap">
